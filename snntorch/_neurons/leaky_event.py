@@ -25,7 +25,6 @@ class LeakyEvent(LIF):
     ):
         super().__init__(
             beta,
-            exp_mode,
             threshold,
             spike_grad,
             surrogate_disable,
@@ -53,15 +52,17 @@ class LeakyEvent(LIF):
 
         # Custom processing
         self.counter = torch.zeros(1)
+        self.exp_mode = exp_mode
 
-        R = 50e6
-        C = 100e-12
+        #R = 50e6
+        #C = 100e-12
         # Number of elements in the list
         num_elements = 60
         # Generate a list of x values (time points)
-        x_values = np.linspace(0, 0.5, num_elements)
+        #x_values = np.linspace(0, 0.5, num_elements)
         # Calculate the corresponding U values
-        self.LUT = np.exp(-x_values / (R * C))
+        #self.LUT = np.exp(-x_values / (R * C))
+        self.LUT = torch.tensor([self.beta.clamp(0,1)**x for x in range(num_elements)], dtype=torch.float32)
 
     def _init_mem(self):
         mem = torch.zeros(0)
