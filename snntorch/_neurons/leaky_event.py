@@ -3,12 +3,18 @@ import torch
 from torch import nn
 import numpy as np
 
+# Framework used to manage the ceration of shift ammount
+import math
+import time
+
 class LeakyEvent(LIF):
 
     def __init__(
         self,
         beta,
         exp_mode="beta",
+        refractory=False,
+        refractory_time=5e5,
         threshold=1.0,
         spike_grad=None,
         surrogate_disable=False,
@@ -51,15 +57,19 @@ class LeakyEvent(LIF):
         self.reset_delay = reset_delay
 
         # Custom processing
-        self.counter = torch.zeros(1)
-        self.exp_mode = exp_mode
+        self.counter            = torch.zeros(1)
+        self.exp_mode           = exp_mode
+        self.refractory_time    = refractory_time
+        self.refractory         = refractory
+        self.last_spike_time    = 0
 
         # Number of elements in the list
         num_elements = 60
+        self.refractory_flag = False
         # LUT containing the beta^n representing the decay at time 'n'
         self.LUT = torch.tensor([self.beta.clamp(0,1)**x for x in range(num_elements)], dtype=torch.float32)
         # shift ammount and balance coefficients are a strategy for emulating HW process on  SW simulation
-        self.shift_amounts, self.balance_coefficients = find_closest_shift_and_balance(self.beta.clamp(0,1))
+        self.shift_amounts, self.balance_coefficients = self._find_closest_shift_and_balance(self.LUT)
 
     def _init_mem(self):
         mem = torch.zeros(0)
@@ -76,6 +86,22 @@ class LeakyEvent(LIF):
     def forward(self, input_, mem=None):
 
         if torch.any(input_ > 0):
+            # Refractory management
+            if self.refractory_flag and self.refractory:
+                if time.time_ns() - self.last_spike_time < self.refractory_time:
+                    self.counter += 1
+                    spk = torch.zeros_like(input_)
+                    self.refractory_flag = True
+                    # End code execution
+                    if self.output:
+                        return spk, self.mem
+                    elif self.init_hidden:
+                        return spk
+                    else:
+                        return spk, self.mem
+                else:
+                    self.refractory_flag = False
+
             if not mem == None:
                 self.mem = mem
 
@@ -108,6 +134,12 @@ class LeakyEvent(LIF):
                     self.mem = self.mem - do_reset * self.threshold
                 elif self.reset_mechanism_val == 1:  # reset to zero
                     self.mem = self.mem - do_reset * self.mem
+
+            # If the neuron emits a spike refractory_flag must be set to start refractory time
+            if torch.any(spk) and self.refractory:
+                self.refractory_flag = True
+                self.last_spike_time = time.time_ns()
+
         else:
             self.counter += 1
             spk = torch.zeros_like(input_)
@@ -136,7 +168,7 @@ class LeakyEvent(LIF):
                     base_fn = input_
             case "shift_add":
                 if 0 <= index < len(self.LUT):
-                    base_fn = self.mem * (2**self.shift_amounts[index]) + self.mem * self.balance_coefficients[index] + input_
+                    base_fn = (self.mem * ((2**self.shift_amounts[index]) + self.balance_coefficients[index])) + input_
                 else:
                     base_fn = input_
             case _:
@@ -155,7 +187,8 @@ class LeakyEvent(LIF):
     def _base_int(self, input_):
         return self._base_state_function(input_)
 
-    def find_closest_shift_and_balance(arr):
+    @staticmethod
+    def _find_closest_shift_and_balance(arr):
         shift_amounts = []
         balance_coefficients = []
 
@@ -175,7 +208,7 @@ class LeakyEvent(LIF):
 
             # Calculate the shift amount and balance coefficient
             shift = int(math.log2(closest_power))
-            balance = num - closest_power, 3
+            balance = num - closest_power
 
             # Store results
             shift_amounts.append(shift)
