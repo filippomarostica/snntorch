@@ -54,15 +54,12 @@ class LeakyEvent(LIF):
         self.counter = torch.zeros(1)
         self.exp_mode = exp_mode
 
-        #R = 50e6
-        #C = 100e-12
         # Number of elements in the list
         num_elements = 60
-        # Generate a list of x values (time points)
-        #x_values = np.linspace(0, 0.5, num_elements)
-        # Calculate the corresponding U values
-        #self.LUT = np.exp(-x_values / (R * C))
+        # LUT containing the beta^n representing the decay at time 'n'
         self.LUT = torch.tensor([self.beta.clamp(0,1)**x for x in range(num_elements)], dtype=torch.float32)
+        # shift ammount and balance coefficients are a strategy for emulating HW process on  SW simulation
+        self.shift_amounts, self.balance_coefficients = find_closest_shift_and_balance(self.beta.clamp(0,1))
 
     def _init_mem(self):
         mem = torch.zeros(0)
@@ -115,29 +112,37 @@ class LeakyEvent(LIF):
             self.counter += 1
             spk = torch.zeros_like(input_)
 
-        return spk, self.mem
-        """
         if self.output:
             return spk, self.mem
         elif self.init_hidden:
             return spk
         else:
             return spk, self.mem
-        """
+
     def _base_state_function(self, input_):
+        index = int(self.counter.item())
+        # Check exponential decay method
         match self.exp_mode:
             case "beta":
                 #base_fn = self.beta.clamp(0, 1) * self.mem + input_
-                index = int(self.counter.item())
                 if 0 <= index < len(self.LUT):
                     base_fn = self.mem * self.LUT[index] + input_
                 else:
                     base_fn = input_
-                self.counter = torch.zeros(1)
-
+            case "shift":
+                if 0 <= index < len(self.LUT):
+                    base_fn = self.mem * (2**self.shift_amounts[index]) + input_
+                else:
+                    base_fn = input_
+            case "shift_add":
+                if 0 <= index < len(self.LUT):
+                    base_fn = self.mem * (2**self.shift_amounts[index]) + self.mem * self.balance_coefficients[index] + input_
+                else:
+                    base_fn = input_
             case _:
                 return "Error exponential mode is incorrect"
 
+        self.counter = torch.zeros(1)
         return base_fn
 
     def _base_sub(self, input_):
@@ -149,6 +154,34 @@ class LeakyEvent(LIF):
 
     def _base_int(self, input_):
         return self._base_state_function(input_)
+
+    def find_closest_shift_and_balance(arr):
+        shift_amounts = []
+        balance_coefficients = []
+
+        for num in arr:
+            if num <= 0:
+                raise ValueError("Numbers must be positive.")
+
+            # Find the closest powers of two
+            power_down = 2**math.floor(math.log2(num))  # Closest lower power of 2
+            power_up = 2**math.ceil(math.log2(num))    # Closest higher power of 2
+
+            # Choose the closest power of two
+            if abs(num - power_down) <= abs(num - power_up):
+                closest_power = power_down
+            else:
+                closest_power = power_up
+
+            # Calculate the shift amount and balance coefficient
+            shift = int(math.log2(closest_power))
+            balance = num - closest_power, 3
+
+            # Store results
+            shift_amounts.append(shift)
+            balance_coefficients.append(balance)
+
+        return shift_amounts, balance_coefficients
 
     @classmethod
     def detach_hidden(cls):
