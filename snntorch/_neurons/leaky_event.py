@@ -14,7 +14,7 @@ class LeakyEvent(LIF):
         beta,
         exp_mode="beta",
         refractory=False,
-        refractory_time=5e5,
+        refractory_time=2e5,
         threshold=1.0,
         spike_grad=None,
         surrogate_disable=False,
@@ -58,6 +58,7 @@ class LeakyEvent(LIF):
 
         # Custom processing
         self.counter            = torch.zeros(1)
+        self.old_time           = torch.zeros(1)
         self.exp_mode           = exp_mode
         self.refractory_time    = refractory_time
         self.refractory         = refractory
@@ -83,66 +84,67 @@ class LeakyEvent(LIF):
         """Deprecated, use :class:`Leaky.reset_mem` instead"""
         return self.reset_mem()
 
-    def forward(self, input_, mem=None):
+    def forward(self, input_, mask, mem=None):
 
-        if torch.any(input_ > 0):
+        #if torch.any(input_ > 0):
             # Refractory management
-            if self.refractory_flag and self.refractory:
-                if time.time_ns() - self.last_spike_time < self.refractory_time:
-                    self.counter += 1
-                    spk = torch.zeros_like(input_)
-                    self.refractory_flag = True
-                    # End code execution
-                    if self.output:
-                        return spk, self.mem
-                    elif self.init_hidden:
-                        return spk
-                    else:
-                        return spk, self.mem
+            #print(input_.size())
+
+        if self.refractory_flag and self.refractory:
+            if time.time_ns() - self.last_spike_time < self.refractory_time:
+                spk = torch.zeros_like(spk)
+                # End code execution
+                if self.output:
+                    return spk, self.mem
+                elif self.init_hidden:
+                    return spk
                 else:
-                    self.refractory_flag = False
-
-            if not mem == None:
-                self.mem = mem
-
-            if self.init_hidden and not mem == None:
-                raise TypeError(
-                    "`mem` should not be passed as an argument while `init_hidden=True`"
-                )
-
-            if not self.mem.shape == input_.shape:
-                self.mem = torch.zeros_like(input_, device=self.mem.device)
-
-            self.reset = self.mem_reset(self.mem)
-            self.mem = self.state_function(input_)
-
-            if self.state_quant:
-                self.mem = self.state_quant(self.mem)
-
-            if self.inhibition:
-                spk = self.fire_inhibition(
-                    self.mem.size(0), self.mem
-                )  # batch_size
+                    return spk, self.mem
             else:
-                spk = self.fire(self.mem)
+                self.refractory_flag = False
 
-            if not self.reset_delay:
-                do_reset = (
-                    spk / self.graded_spikes_factor - self.reset
-                )  # avoid double reset
-                if self.reset_mechanism_val == 0:  # reset by subtraction
-                    self.mem = self.mem - do_reset * self.threshold
-                elif self.reset_mechanism_val == 1:  # reset to zero
-                    self.mem = self.mem - do_reset * self.mem
+        if not mem == None:
+            self.mem = mem
 
-            # If the neuron emits a spike refractory_flag must be set to start refractory time
-            if torch.any(spk) and self.refractory:
-                self.refractory_flag = True
-                self.last_spike_time = time.time_ns()
+        if self.init_hidden and not mem == None:
+            raise TypeError(
+                "`mem` should not be passed as an argument while `init_hidden=True`"
+            )
+
+        if not self.mem.shape == input_.shape:
+            self.mem = torch.zeros_like(input_, device=self.mem.device)
+
+        self.reset = self.mem_reset(self.mem)
+        self.mem = self.state_function(input_, mask)
+
+        if self.state_quant:
+            self.mem = self.state_quant(self.mem)
+
+        if self.inhibition:
+            spk = self.fire_inhibition(
+                self.mem.size(0), self.mem
+            )  # batch_size
+        else:
+            spk = self.fire(self.mem)
+
+        if not self.reset_delay:
+            do_reset = (
+                spk / self.graded_spikes_factor - self.reset
+            )  # avoid double reset
+            if self.reset_mechanism_val == 0:  # reset by subtraction
+                self.mem = self.mem - do_reset * self.threshold
+            elif self.reset_mechanism_val == 1:  # reset to zero
+                self.mem = self.mem - do_reset * self.mem
+
+        # If the neuron emits a spike refractory_flag must be set to start refractory time
+        if torch.any(spk) and self.refractory:
+            self.refractory_flag = True
+            self.last_spike_time = time.time_ns()
 
         else:
             self.counter += 1
-            spk = torch.zeros_like(input_)
+            print("NO INPUT")
+            spk = torch.zeros_like(spk)
 
         if self.output:
             return spk, self.mem
@@ -151,8 +153,12 @@ class LeakyEvent(LIF):
         else:
             return spk, self.mem
 
-    def _base_state_function(self, input_):
-        index = int(self.counter.item())
+    def _base_state_function(self, input_, time):
+        index = self.old_time - time
+
+        #index = int(self.counter.item())
+        #print(f"index = {index}")
+
         # Check exponential decay method
         match self.exp_mode:
             case "beta":
@@ -174,18 +180,18 @@ class LeakyEvent(LIF):
             case _:
                 return "Error exponential mode is incorrect"
 
-        self.counter = torch.zeros(1)
+        self.old_time = time
         return base_fn
 
-    def _base_sub(self, input_):
-        return self._base_state_function(input_) - self.reset * self.threshold
+    def _base_sub(self, input_, time):
+        return self._base_state_function(input_, time) - self.reset * self.threshold
 
-    def _base_zero(self, input_):
+    def _base_zero(self, input_, time):
         self.mem = (1 - self.reset) * self.mem
-        return self._base_state_function(input_)
+        return self._base_state_function(input_, time)
 
-    def _base_int(self, input_):
-        return self._base_state_function(input_)
+    def _base_int(self, input_, time):
+        return self._base_state_function(input_, time)
 
     @staticmethod
     def _find_closest_shift_and_balance(arr):
