@@ -57,8 +57,7 @@ class LeakyEvent(LIF):
         self.reset_delay = reset_delay
 
         # Custom processing
-        self.counter            = torch.zeros(1)
-        self.old_time           = torch.zeros(1)
+        self.counter            = torch.zeros(128, dtype=torch.int)
         self.exp_mode           = exp_mode
         self.refractory_time    = refractory_time
         self.refractory         = refractory
@@ -89,7 +88,7 @@ class LeakyEvent(LIF):
         #if torch.any(input_ > 0):
             # Refractory management
             #print(input_.size())
-
+        print(f"mask in neuron - forward --> {mask.size()}, mask value {mask}")
         if self.refractory_flag and self.refractory:
             if time.time_ns() - self.last_spike_time < self.refractory_time:
                 spk = torch.zeros_like(spk)
@@ -141,11 +140,6 @@ class LeakyEvent(LIF):
             self.refractory_flag = True
             self.last_spike_time = time.time_ns()
 
-        else:
-            self.counter += 1
-            print("NO INPUT")
-            spk = torch.zeros_like(spk)
-
         if self.output:
             return spk, self.mem
         elif self.init_hidden:
@@ -153,45 +147,86 @@ class LeakyEvent(LIF):
         else:
             return spk, self.mem
 
-    def _base_state_function(self, input_, time):
-        index = self.old_time - time
+    def _base_state_function(self, input_, mask):
 
-        #index = int(self.counter.item())
-        #print(f"index = {index}")
+        batch_size, num_neurons = input_.shape
+        #print(input_.size())
+        #print(mask.size())
 
-        # Check exponential decay method
-        match self.exp_mode:
-            case "beta":
-                #base_fn = self.beta.clamp(0, 1) * self.mem + input_
-                if 0 <= index < len(self.LUT):
-                    base_fn = self.mem * self.LUT[index] + input_
-                else:
-                    base_fn = input_
-            case "shift":
-                if 0 <= index < len(self.LUT):
-                    base_fn = self.mem * (2**self.shift_amounts[index]) + input_
-                else:
-                    base_fn = input_
-            case "shift_add":
-                if 0 <= index < len(self.LUT):
-                    base_fn = (self.mem * ((2**self.shift_amounts[index]) + self.balance_coefficients[index])) + input_
-                else:
-                    base_fn = input_
-            case _:
-                return "Error exponential mode is incorrect"
+        # Iterate over each batch element
+        for batch_idx in range(batch_size):
+            if mask[batch_idx] == 1:
+               # for neuron_idx in range(num_neurons):
+                # Check exponential decay method
+                match self.exp_mode:
+                    case "beta":
+                        #base_fn = self.beta.clamp(0, 1) * self.mem + input_
+                        if 0 <= self.counter[batch_idx] < len(self.LUT):
+                            base_fn[batch_idx] = self.mem[batch_idx] * self.LUT[self.counter[batch_idx]] + input_[batch_idx]
+                        else:
+                            base_fn[batch_idx] = input_[batch_idx]
+                    case "shift":
+                        if 0 <= self.counter[batch_idx] < len(self.LUT):
+                            base_fn[batch_idx] = self.mem[batch_idx] * (2**self.shift_amounts[self.counter[batch_idx]]) \
+                                      + input_[batch_idx]
+                        else:
+                            base_fn[batch_idx] = input_[batch_idx]
+                    case "shift_add":
+                        if 0 <= self.counter[batch_idx] < len(self.LUT):
+                            base_fn[batch_idx] = (self.mem[batch_idx] * ((2**self.shift_amounts[self.counter[batch_idx]]) \
+                                      + self.balance_coefficients[self.counter[batch_idx]])) + input_[batch_idx]
+                        else:
+                            base_fn[batch_idx] = input_[batch_idx]
+                    case _:
+                        return "Error exponential mode is incorrect"
+                self.counter[batch_idx] = 0
+            else:
+                self.counter[batch_idx] += 1
 
-        self.old_time = time
         return base_fn
 
-    def _base_sub(self, input_, time):
-        return self._base_state_function(input_, time) - self.reset * self.threshold
+    def _base_state_function_serial(self, input_, mask):
+        batch_size, num_neurons = input_.shape
+            # Iterate over each batch element
+        for batch_idx in range(batch_size):
+            current_mask = mask[batch_idx]
+            if current_mask == 0:
+                self.counter[batch_idx] += 1  # Increment counter for this batch
+            else:
+                # Check exponential decay method
+                index = self.counter[batch_idx]
+                match self.exp_mode:
+                    case "beta":
+                        #base_fn = self.beta.clamp(0, 1) * self.mem + input_
+                        if 0 <= index < len(self.LUT):
+                            base_fn = self.mem * self.LUT[index] + input_
+                        else:
+                            base_fn = input_
+                    case "shift":
+                        if 0 <= index < len(self.LUT):
+                            base_fn = self.mem * (2**self.shift_amounts[index]) + input_
+                        else:
+                            base_fn = input_
+                    case "shift_add":
+                        if 0 <= index < len(self.LUT):
+                            base_fn = (self.mem * ((2**self.shift_amounts[index]) + self.balance_coefficients[index])) + input_
+                        else:
+                            base_fn = input_
+                    case _:
+                        return "Error exponential mode is incorrect"
+                # Finally reset the counter
+                self.counter[batch_idx] = 0
+        return base_fn
 
-    def _base_zero(self, input_, time):
+    def _base_sub(self, input_, mask):
+        return self._base_state_function(input_, mask) - self.reset * self.threshold
+
+    def _base_zero(self, input_, mask):
         self.mem = (1 - self.reset) * self.mem
-        return self._base_state_function(input_, time)
+        return self._base_state_function(input_, mask)
 
-    def _base_int(self, input_, time):
-        return self._base_state_function(input_, time)
+    def _base_int(self, input_, mask):
+        return self._base_state_function(input_, mask)
 
     @staticmethod
     def _find_closest_shift_and_balance(arr):
